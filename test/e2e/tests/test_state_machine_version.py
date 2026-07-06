@@ -128,6 +128,41 @@ class TestStateMachineVersion:
 
         time.sleep(DELETE_WAIT_AFTER_SECONDS)
 
+    def test_custom_find_state_machine_version(self, sfn_client, state_machine_and_version):
+        """Exercise customFindStateMachineVersion, the custom read hook.
+
+        There is no DescribeStateMachineVersion API, so the controller reads
+        a version by calling DescribeStateMachine with the version ARN. Cover
+        both branches: a successful read (the CR only reaches
+        ACK.ResourceSynced=True through this hook), and the mapping of
+        StateMachineDoesNotExist to NotFound, without which a version deleted
+        out-of-band would leave the CR stuck behind its finalizer.
+        """
+        (sm_ref, sm_cr, ver_ref, ver_cr) = state_machine_and_version
+
+        sfn_helper = SFNHelper(sfn_client)
+        version_arn = ver_cr["status"]["ackResourceMetadata"]["arn"]
+
+        # The same call the hook makes: DescribeStateMachine with the version
+        # ARN. It must return the version's own data, echoing the version ARN.
+        aws_version = sfn_helper.get_state_machine(version_arn)
+        assert aws_version is not None
+        assert aws_version["stateMachineArn"] == version_arn
+        assert aws_version["description"] == "Version 1 - initial release"
+
+        # A synced CR proves the controller read the version back through the
+        # hook after creation.
+        assert k8s.wait_on_condition(ver_ref, "ACK.ResourceSynced", "True", wait_periods=10)
+
+        # Delete the version out-of-band, then delete the CR. Deletion only
+        # completes if the hook maps StateMachineDoesNotExist to NotFound so
+        # the controller treats the resource as already gone.
+        sfn_helper.delete_state_machine_version(version_arn)
+        assert sfn_helper.get_state_machine(version_arn) is None
+
+        _, deleted = k8s.delete_custom_resource(ver_ref, 3, 10)
+        assert deleted is True
+
     def test_immutable_update_rejected(self, sfn_client, state_machine_and_version):
         """Verify that updating a version spec causes a rejection.
 
